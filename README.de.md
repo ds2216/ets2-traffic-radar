@@ -136,3 +136,7 @@ und `plugins\traffic_radar\server.log`.
 - Keine Straßen auf dem Radar – nur Fahrzeuge und Ampeln.
 - Bildschirm-Wachhalten am Tablet funktioniert über `http://` nicht (Browser-Beschränkung) – ggf. die
   Bildschirm-Zeitsperre am Tablet hochsetzen.
+
+## Lizenz
+
+MIT, siehe [LICENSE](LICENSE). Das ETS2LA-Plugin in `vendor/ets2la-plugin` und die Bibliothek QRCoder stehen unter ihrer eigenen MIT-Lizenz.

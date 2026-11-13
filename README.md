@@ -144,3 +144,7 @@ and `plugins\traffic_radar\server.log`.
 - No roads on the radar – only vehicles and traffic lights.
 - Keeping the tablet screen awake does not work over `http://` (browser restriction) – raise the screen
   timeout on the tablet if needed.
+
+## License
+
+MIT, see [LICENSE](LICENSE). The ETS2LA plugin in `vendor/ets2la-plugin` and the QRCoder library have their own MIT licenses.
