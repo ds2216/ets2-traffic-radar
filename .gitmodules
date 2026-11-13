@@ -1,0 +1,3 @@
+[submodule "vendor/ets2la-plugin"]
+	path = vendor/ets2la-plugin
+	url = https://github.com/ETS2LA/plugin.git

@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0b0f14">
+<title>Verkehrsradar</title>
+<style>
+  :root {
+    --bg: #0b0f14; --fg: #e6edf3; --muted: #7d8590; --ring: #1f2a35; --ringtxt: #3d4b59;
+    --own: #58a6ff; --idle: #6e7681; --move: #e3b341; --warn: #ff5c50;
+    --red: #ff4d4d; --amber: #f2a93b; --green: #3fd06a;
+    --btn: #161b22; --btnline: #30363d;
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 15px/1.3 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden;
+    touch-action: manipulation; -webkit-user-select: none; user-select: none; }
+  #c, #k { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  /* own layer for the compass above the #msg overlay, so it stays visible while the radar is paused */
+  #k { pointer-events: none; z-index: 2; }
+  #bar { position: fixed; left: 0; right: 0; top: 0; display: flex; gap: 8px; align-items: center;
+    flex-wrap: wrap; padding: 8px 12px; padding-top: max(8px, env(safe-area-inset-top));
+    background: linear-gradient(var(--bg) 60%, transparent); z-index: 2; }
+  button { background: var(--btn); color: var(--fg); border: 1px solid var(--btnline); border-radius: 8px;
+    padding: 7px 11px; font: inherit; font-size: 14px; cursor: pointer; }
+  button.on { border-color: var(--own); color: var(--own); }
+  /* QR code with the LAN address, for connecting a phone/tablet; tap to enlarge */
+  #bQr { padding: 2px; background: #fff; border-color: #fff; line-height: 0; }
+  #bQr img { width: 40px; height: 40px; display: block; }
+  #qrBig { position: fixed; inset: 0; z-index: 3; display: none; flex-direction: column; gap: 14px;
+    align-items: center; justify-content: center; background: color-mix(in srgb, var(--bg) 88%, transparent); cursor: pointer; }
+  #qrBig img { width: min(70vmin, 360px); height: auto; background: #fff; border-radius: 12px; padding: 10px; }
+  #qrBig span { font-size: 17px; }
+  #qrBig small { color: var(--muted); }
+  #status { color: var(--muted); font-size: 12px; position: fixed; left: 12px; bottom: 8px; z-index: 2; }
+  #legend { color: var(--muted); font-size: 12px; position: fixed; right: 12px; bottom: 8px; z-index: 2;
+    display: flex; gap: 12px; }
+  #legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+  #msg { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; text-align: center;
+    flex-direction: column; gap: 6px; padding: 24px; background: color-mix(in srgb, var(--bg) 82%, transparent);
+    pointer-events: none; z-index: 1; }
+  #msg b { font-size: 22px; font-weight: 600; }
+  #msg span { color: var(--muted); max-width: 34em; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<canvas id="k"></canvas>
+<div id="bar">
+  <button id="bRange" title="Sichtbereich">60 m</button>
+  <button id="bOrient" title="Ausrichtung">Fahrtrichtung oben</button>
+  <button id="bLimit" title="Radar nur unterhalb dieser Geschwindigkeit">aktiv &lt; 50</button>
+  <button id="bAlways" title="Radar unabhängig vom Tempo zeigen">Immer</button>
+  <button id="bFull" title="Vollbild">⛶</button>
+  <button id="bQr" hidden><img alt="QR-Code"></button>
+</div>
+<div id="qrBig"><img id="qrBigImg" alt="QR-Code"><span id="qrUrl"></span><small>Mit der Handy- oder Tablet-Kamera scannen · Tippen zum Schließen</small></div>
+<div id="msg"><b id="msgTitle"></b><span id="msgText"></span></div>
+<div id="status">Verbinde …</div>
+<div id="legend">
+  <span><i style="background:var(--warn)"></i>nähert sich</span>
+  <span><i style="background:var(--move)"></i>fährt</span>
+  <span><i style="background:var(--idle)"></i>steht</span>
+</div>
+<script>
+(() => {
+  const RANGES = [50, 100, 120, 150];
+  const LIMITS = [30, 40, 50, 60, 70, 80];
+  // values saved by an older version may not be in the lists any more: snap to the nearest one
+  const nearest = (list, v) => list.reduce((a, b) => Math.abs(b - v) < Math.abs(a - v) ? b : a);
+  const HYST = 3;                // km/h hysteresis around the limit
+  const PREDICT_S = 3;           // length of the motion line in seconds
+  const WARN_DIST = 70, WARN_CLOSING = 1.5;
+
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem('radar.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+    set(k, v) { try { localStorage.setItem('radar.' + k, JSON.stringify(v)); } catch {} },
+  };
+  const q = new URLSearchParams(location.search);
+  const cfg = {
+    range: nearest(RANGES, +q.get('range') || store.get('range', 50)),
+    headingUp: store.get('headingUp', true),
+    limit: nearest(LIMITS, +q.get('limit') || store.get('limit', 50)),
+    always: store.get('always', false),
+  };
+
+  const css = getComputedStyle(document.documentElement);
+  const col = n => css.getPropertyValue('--' + n).trim();
+  const C = { own: col('own'), idle: col('idle'), move: col('move'), warn: col('warn'), ring: col('ring'),
+              ringtxt: col('ringtxt'), red: col('red'), amber: col('amber'), green: col('green'), bg: col('bg') };
+
+  const $ = id => document.getElementById(id);
+  const canvas = $('c'), ctx = canvas.getContext('2d');
+  const kcanvas = $('k'), kctx = kcanvas.getContext('2d');
+  let snap = null, lastMsgAt = 0, active = true;
+
+  function renderButtons() {
+    $('bRange').textContent = cfg.range + ' m';
+    $('bOrient').textContent = cfg.headingUp ? 'Fahrtrichtung oben' : 'Norden oben';
+    $('bLimit').textContent = 'aktiv < ' + cfg.limit;
+    $('bAlways').classList.toggle('on', cfg.always);
+  }
+  $('bRange').onclick = () => { cfg.range = RANGES[(RANGES.indexOf(cfg.range) + 1) % RANGES.length]; store.set('range', cfg.range); renderButtons(); };
+  $('bOrient').onclick = () => { cfg.headingUp = !cfg.headingUp; store.set('headingUp', cfg.headingUp); renderButtons(); };
+  $('bLimit').onclick = () => { cfg.limit = LIMITS[(LIMITS.indexOf(cfg.limit) + 1) % LIMITS.length]; store.set('limit', cfg.limit); renderButtons(); };
+  $('bAlways').onclick = () => { cfg.always = !cfg.always; store.set('always', cfg.always); renderButtons(); };
+  $('bFull').onclick = () => {
+    const d = document;
+    if (d.fullscreenElement) d.exitFullscreen?.(); else d.documentElement.requestFullscreen?.().catch(() => {});
+    requestWakeLock();
+  };
+  renderButtons();
+
+  // QR code for phones/tablets – only on the PC; on a touch device it would be pointless
+  if (!matchMedia('(pointer: coarse)').matches) {
+    fetch('info').then(r => r.json()).then(info => {
+      if (!info.lanUrl) return;
+      const src = 'qr.svg?' + Date.now();
+      $('bQr').querySelector('img').src = src;
+      $('qrBigImg').src = src;
+      $('qrUrl').textContent = info.lanUrl;
+      $('bQr').title = 'Mit Handy/Tablet verbinden: ' + info.lanUrl;
+      $('bQr').hidden = false;
+    }).catch(() => {});
+  }
+  $('bQr').onclick = () => { $('qrBig').style.display = 'flex'; };
+  $('qrBig').onclick = () => { $('qrBig').style.display = 'none'; };
+
+  // keep a tablet screen on (only works on https/localhost; silently ignored otherwise)
+  let wakeLock = null;
+  async function requestWakeLock() {
+    try { if ('wakeLock' in navigator && !wakeLock) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.onrelease = () => wakeLock = null; } } catch {}
+  }
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') requestWakeLock(); });
+  requestWakeLock();
+
+  // ---- data ----
+  function connect() {
+    const es = new EventSource('events');
+    es.onmessage = e => { snap = JSON.parse(e.data); lastMsgAt = performance.now(); };
+    es.onerror = () => {
+      $('status').textContent = 'Verbindung unterbrochen – versuche erneut …';
+      // browsers retry on their own, but give up for good on some errors: then start over
+      if (es.readyState === EventSource.CLOSED) setTimeout(connect, 3000);
+    };
+  }
+  connect();
+
+  // ---- geometry ----
+  // World: x east, z south. Truck forward (fx, fz); right vector = (-fz, fx).
+  function basis() {
+    if (cfg.headingUp && snap) return { fx: snap.fx, fz: snap.fz, rx: -snap.fz, rz: snap.fx };
+    // north up: geographic north like the in-game navigation. The world's -z axis is only "grid north";
+    // true north is turned by the meridian convergence (snap.conv, ~30° in Iceland).
+    const t = snap?.conv ?? 0;
+    return { fx: -Math.sin(t), fz: -Math.cos(t), rx: Math.cos(t), rz: -Math.sin(t) };
+  }
+  const toLocal = (b, dx, dz) => ({ r: dx * b.rx + dz * b.rz, a: dx * b.fx + dz * b.fz });
+
+  function shape(w, l, tip) {
+    ctx.beginPath();
+    const hw = w / 2, hl = l / 2;
+    if (tip) {
+      const t = Math.min(w * 0.75, l * 0.4);
+      ctx.moveTo(0, -hl); ctx.lineTo(hw, -hl + t); ctx.lineTo(hw, hl); ctx.lineTo(-hw, hl); ctx.lineTo(-hw, -hl + t);
+    } else {
+      ctx.rect(-hw, -hl, w, l);
+    }
+    ctx.closePath();
+  }
+
+  function drawBox(view, b, box, color, tip, alpha) {
+    const p = toLocal(b, box.dx, box.dz), d = toLocal(b, box.fx, box.fz);
+    const sx = view.cx + p.r * view.s, sy = view.cy - p.a * view.s;
+    const w = Math.max(box.w * view.s, 6), l = Math.max(box.l * view.s, tip ? 11 : 8);
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(Math.atan2(d.r, d.a));
+    ctx.globalAlpha = alpha;
+    shape(w, l, tip);
+    ctx.fillStyle = color; ctx.fill();
+    ctx.lineWidth = 1.5; ctx.strokeStyle = C.bg; ctx.stroke();
+    ctx.restore();
+    return { sx, sy, dr: d.r, da: d.a, l };
+  }
+
+  function classify(v) {
+    const sp = Math.abs(v.v);
+    if (sp < 0.5) return 'idle';
+    const dist = Math.hypot(v.dx, v.dz) || 1;
+    const closing = -(v.dx * v.fx + v.dz * v.fz) * v.v / dist; // m/s towards us
+    return closing > WARN_CLOSING && dist < WARN_DIST ? 'warn' : 'move';
+  }
+
+  function lightColor(l) {
+    if (l.type !== 1) return null;
+    switch (l.state) {
+      case 1: case 2: return C.red;
+      case 4: return C.amber;
+      case 8: return C.green;
+      case 32: return (performance.now() % 1000) < 500 ? C.amber : null;
+      default: return null;
+    }
+  }
+
+  // ---- render ----
+  function frame() {
+    requestAnimationFrame(frame);
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
+      canvas.width = kcanvas.width = Math.round(W * dpr); canvas.height = kcanvas.height = Math.round(H * dpr);
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+    kctx.setTransform(1, 0, 0, 1, 0, 0); kctx.clearRect(0, 0, kcanvas.width, kcanvas.height);
+    kctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const top = $('bar').offsetHeight + 6, bottom = 28;
+    const cy = cfg.headingUp ? top + (H - top - bottom) * 0.62 : top + (H - top - bottom) / 2;
+    const cx = W / 2;
+    const s = Math.max(0.5, Math.min((cy - top) / cfg.range, (W / 2 - 10) / cfg.range));
+    const view = { cx, cy, s };
+
+    const stale = performance.now() - lastMsgAt > 2000;
+    const ok = snap && snap.ok && !stale;
+    const kmh = ok ? snap.speedKmh : 0;
+    if (ok) active = cfg.always || (active ? kmh <= cfg.limit + HYST : kmh < cfg.limit);
+
+    $('status').textContent = !snap ? 'Verbinde …' : stale ? 'Keine Daten vom Server' :
+      ok ? `${snap.vehicles.length} Fahrzeuge im Umkreis` : snap.status;
+
+    // range rings
+    // round ring spacing, at most 5 rings: 50 m -> 10, 100 m -> 20, 120 m -> 25, 150 m -> 30
+    const step = [10, 20, 25, 30, 50].find(st => cfg.range / st <= 5) ?? cfg.range / 3;
+    ctx.lineWidth = 1; ctx.strokeStyle = C.ring; ctx.fillStyle = C.ringtxt;
+    ctx.font = '11px system-ui, sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+    for (let r = step; r <= cfg.range * 1.6; r += step) {
+      ctx.beginPath(); ctx.arc(cx, cy, r * s, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillText(Math.round(r) + ' m', cx + 4, cy - r * s - 2);
+    }
+    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, H); ctx.moveTo(0, cy); ctx.lineTo(W, cy); ctx.stroke();
+
+    if (!cfg.headingUp) { ctx.fillStyle = C.ringtxt; ctx.textAlign = 'center'; ctx.fillText('N', cx, top + 14); }
+    const msg = $('msg');
+    if (!ok) {
+      msg.style.display = 'flex';
+      $('msgTitle').textContent = !snap || stale ? 'Keine Verbindung' : 'Radar wartet';
+      $('msgText').textContent = !snap ? 'Verbinde mit dem Radar-Server …' : stale ? 'Der Radar-Server antwortet nicht.' : snap.status;
+      drawOwn(view);
+      return;
+    }
+    if (!active) {
+      msg.style.display = 'flex';
+      $('msgTitle').textContent = 'Radar pausiert';
+      $('msgText').textContent = `Aktiv unter ${cfg.limit} km/h (gerade ${Math.round(kmh)} km/h).`;
+      drawOwn(view);
+      return;
+    }
+    msg.style.display = 'none';
+
+    const b = basis();
+    const reach = cfg.range * 1.8;
+
+    // traffic lights first (beneath vehicles)
+    for (const l of snap.lights) {
+      if (Math.hypot(l.dx, l.dz) > reach) continue;
+      const c = lightColor(l);
+      const p = toLocal(b, l.dx, l.dz);
+      const sx = cx + p.r * s, sy = cy - p.a * s;
+      ctx.beginPath(); ctx.arc(sx, sy, 5, 0, Math.PI * 2);
+      if (c) { ctx.fillStyle = c; ctx.fill(); } else { ctx.strokeStyle = C.idle; ctx.lineWidth = 1.5; ctx.stroke(); }
+    }
+
+    // vehicles, farthest first so near ones are on top
+    const vs = snap.vehicles.filter(v => Math.hypot(v.dx, v.dz) <= reach)
+      .sort((a, z) => Math.hypot(z.dx, z.dz) - Math.hypot(a.dx, a.dz));
+    for (const v of vs) {
+      const kind = classify(v);
+      const color = C[kind];
+      for (const t of v.trailers) drawBox(view, b, t, color, false, 0.75);
+      const h = drawBox(view, b, v, color, true, 1);
+      if (kind !== 'idle') {
+        // motion line: where the vehicle will be in PREDICT_S seconds
+        const len = v.v * PREDICT_S * s;
+        const ux = h.dr, uy = -h.da;
+        const fx0 = h.sx + ux * h.l / 2, fy0 = h.sy + uy * h.l / 2;
+        ctx.save(); ctx.globalAlpha = 0.55; ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.setLineDash([5, 5]);
+        ctx.beginPath(); ctx.moveTo(fx0, fy0); ctx.lineTo(fx0 + ux * len, fy0 + uy * len); ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    drawOwn(view);
+  }
+
+  // Compass: heading clockwise from north. The rose always stays fixed (N at the top) and the
+  // needle shows the direction of travel – in both radar orientations.
+  const DIRS = ['N', 'NO', 'O', 'SO', 'S', 'SW', 'W', 'NW'];
+  function drawCompass(x, y, R) {
+    const ctx = kctx; // compass layer, above the "paused" overlay
+    const hdg = snap.hdg ?? (((Math.atan2(snap.fx, -snap.fz) * 180 / Math.PI) + 360) % 360); // geographic
+    const h = hdg * Math.PI / 180;
+    const rose = 0, needle = h;
+
+    ctx.save();
+    ctx.beginPath(); ctx.arc(x, y, R, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(22,27,34,0.85)'; ctx.fill();
+    ctx.lineWidth = 1.5; ctx.strokeStyle = C.ringtxt; ctx.stroke();
+
+    // ticks every 30°, longer at the cardinal points
+    for (let d = 0; d < 360; d += 30) {
+      const a = rose + d * Math.PI / 180, s = Math.sin(a), c = Math.cos(a);
+      const r0 = d % 90 === 0 ? R - 9 : R - 5;
+      ctx.beginPath(); ctx.moveTo(x + s * r0, y - c * r0); ctx.lineTo(x + s * (R - 1), y - c * (R - 1));
+      ctx.lineWidth = 1.5; ctx.strokeStyle = C.ringtxt; ctx.stroke();
+    }
+    ctx.font = '600 12px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ['N', 'O', 'S', 'W'].forEach((t, i) => {
+      const a = rose + i * Math.PI / 2;
+      ctx.fillStyle = t === 'N' ? C.red : C.idle;
+      ctx.fillText(t, x + Math.sin(a) * (R - 17), y - Math.cos(a) * (R - 17));
+    });
+
+    // needle = direction of travel
+    ctx.translate(x, y); ctx.rotate(needle);
+    ctx.beginPath(); ctx.moveTo(0, -(R - 6)); ctx.lineTo(6, 4); ctx.lineTo(0, 0); ctx.lineTo(-6, 4); ctx.closePath();
+    ctx.fillStyle = C.own; ctx.fill();
+    ctx.restore();
+
+    // text below: e.g. "NO 47°"
+    ctx.font = '600 13px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    ctx.fillStyle = col('fg');
+    ctx.fillText(`${DIRS[Math.round(hdg / 45) % 8]} ${Math.round(hdg) % 360}°`, x, y + R + 5);
+  }
+
+  function drawOwn(view) {
+    const b = basis();
+    const box = { dx: 0, dz: 0, fx: snap?.fx ?? 0, fz: snap?.fz ?? -1, w: 2.5, l: 6.5 };
+    drawBox(view, b, box, C.own, true, 1);
+    // compass on its own layer: never covered by vehicles or by the "Radar pausiert" overlay
+    if (snap?.ok) drawCompass(canvas.clientWidth - 52, $('bar').offsetHeight + 46, 38);
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
